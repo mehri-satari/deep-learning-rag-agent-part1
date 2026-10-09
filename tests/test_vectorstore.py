@@ -1,191 +1,144 @@
-"""
-test_vectorstore.py
-===================
-Unit tests for VectorStoreManager.
-
-These tests cover the components most likely to be asked about
-in technical interviews: duplicate detection, ingestion correctness,
-retrieval with filters, and the hallucination guard threshold.
-
-Run with: uv run pytest tests/ -v
-
-PEP 8 | OOP
-"""
-
-from __future__ import annotations
+"""Integration tests against persistent ChromaDB and real local embeddings."""
 
 import pytest
 
 from rag_agent.agent.state import ChunkMetadata, DocumentChunk
+from rag_agent.config import Settings
 from rag_agent.vectorstore.store import VectorStoreManager
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
-def sample_chunk() -> DocumentChunk:
-    """A single valid DocumentChunk for use across tests."""
-    metadata = ChunkMetadata(
-        topic="LSTM",
-        difficulty="intermediate",
-        type="concept_explanation",
-        source="test_lstm.md",
-        related_topics=["RNN", "vanishing_gradient"],
-        is_bonus=False,
-    )
-    return DocumentChunk(
-        chunk_id=VectorStoreManager.generate_chunk_id("test_lstm.md", "test content"),
-        chunk_text=(
-            "Long Short-Term Memory networks solve the vanishing gradient problem "
-            "through gated mechanisms: the forget gate, input gate, and output gate. "
-            "These gates control information flow through the cell state, allowing "
-            "the network to maintain relevant information across long sequences."
-        ),
-        metadata=metadata,
+def store(tmp_path):
+    return VectorStoreManager(
+        Settings(
+            _env_file=None,
+            chroma_db_path=str(tmp_path / "chroma"),
+            similarity_threshold=0.3,
+        )
     )
 
 
 @pytest.fixture
-def bonus_chunk() -> DocumentChunk:
-    """A bonus topic chunk (GAN) for testing is_bonus filtering."""
-    metadata = ChunkMetadata(
-        topic="GAN",
-        difficulty="advanced",
-        type="architecture",
-        source="test_gan.md",
-        related_topics=["autoencoder", "generative_models"],
-        is_bonus=True,
+def sample_chunk():
+    text = (
+        "Long Short-Term Memory networks use the forget gate to decide what "
+        "information should be removed from the cell state. The input gate "
+        "stores new information and the output gate controls the next hidden state."
     )
     return DocumentChunk(
-        chunk_id=VectorStoreManager.generate_chunk_id("test_gan.md", "gan content"),
-        chunk_text=(
-            "Generative Adversarial Networks consist of two competing neural networks: "
-            "a generator that produces synthetic data and a discriminator that "
-            "distinguishes real from generated samples. Training is a minimax game."
+        VectorStoreManager.generate_chunk_id("lstm_intermediate.md", text),
+        text,
+        ChunkMetadata(
+            "LSTM",
+            "intermediate",
+            "concept_explanation",
+            "lstm_intermediate.md",
+            ["RNN"],
+            False,
         ),
-        metadata=metadata,
     )
 
 
-# ---------------------------------------------------------------------------
-# Chunk ID Generation Tests
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def bonus_chunk():
+    text = (
+        "Generative Adversarial Networks consist of a generator producing synthetic "
+        "data and a discriminator distinguishing real from generated samples."
+    )
+    return DocumentChunk(
+        VectorStoreManager.generate_chunk_id("gan_advanced.md", text),
+        text,
+        ChunkMetadata("GAN", "advanced", "architecture", "gan_advanced.md", [], True),
+    )
 
 
-class TestChunkIdGeneration:
-    """Tests for the deterministic chunk ID generation logic."""
-
-    def test_same_content_produces_same_id(self) -> None:
-        """Identical source and text must always produce the same ID."""
-        id1 = VectorStoreManager.generate_chunk_id("lstm.md", "same content")
-        id2 = VectorStoreManager.generate_chunk_id("lstm.md", "same content")
-        assert id1 == id2
-
-    def test_different_content_produces_different_id(self) -> None:
-        """Different text must produce different IDs."""
-        id1 = VectorStoreManager.generate_chunk_id("lstm.md", "content one")
-        id2 = VectorStoreManager.generate_chunk_id("lstm.md", "content two")
-        assert id1 != id2
-
-    def test_different_source_produces_different_id(self) -> None:
-        """Same text from different sources must produce different IDs."""
-        id1 = VectorStoreManager.generate_chunk_id("file_a.md", "same text")
-        id2 = VectorStoreManager.generate_chunk_id("file_b.md", "same text")
-        assert id1 != id2
-
-    def test_id_is_16_characters(self) -> None:
-        """Generated IDs must be exactly 16 hex characters."""
-        chunk_id = VectorStoreManager.generate_chunk_id("source.md", "text")
-        assert len(chunk_id) == 16
-        assert all(c in "0123456789abcdef" for c in chunk_id)
+def test_chunk_ids_are_deterministic_and_source_specific():
+    generate = VectorStoreManager.generate_chunk_id
+    value = generate("a.md", "text")
+    assert value == generate("a.md", "text")
+    assert value != generate("a.md", "different")
+    assert value != generate("b.md", "text")
+    assert len(value) == 16
+    assert all(character in "0123456789abcdef" for character in value)
 
 
-# ---------------------------------------------------------------------------
-# Duplicate Detection Tests
-# ---------------------------------------------------------------------------
+def test_duplicate_guard(store, sample_chunk):
+    assert not store.check_duplicate(sample_chunk.chunk_id)
+    first = store.ingest([sample_chunk])
+    assert first.ingested == 1 and not first.errors
+    assert store.check_duplicate(sample_chunk.chunk_id)
+    second = store.ingest([sample_chunk])
+    assert second.ingested == 0 and second.skipped == 1
+    assert store.get_collection_stats()["total_chunks"] == 1
 
 
-class TestDuplicateDetection:
-    """
-    Tests for the check_duplicate method.
-
-    Interview talking point: these tests verify the core invariant
-    of the duplicate guard — the system must never silently ingest
-    the same content twice.
-    """
-
-    def test_new_chunk_is_not_duplicate(
-        self, tmp_path, sample_chunk: DocumentChunk
-    ) -> None:
-        """A chunk that has never been ingested must not be flagged as duplicate."""
-        # TODO: implement using a test ChromaDB path in tmp_path
-        # store = VectorStoreManager(settings=test_settings(chroma_db_path=tmp_path))
-        # assert store.check_duplicate(sample_chunk.chunk_id) is False
-        pytest.skip("Implement after VectorStoreManager is complete")
-
-    def test_ingested_chunk_is_duplicate(
-        self, tmp_path, sample_chunk: DocumentChunk
-    ) -> None:
-        """A chunk that has been ingested must be flagged as duplicate on re-check."""
-        # TODO: ingest chunk, then check_duplicate → True
-        pytest.skip("Implement after VectorStoreManager is complete")
-
-    def test_ingestion_skips_duplicate(
-        self, tmp_path, sample_chunk: DocumentChunk
-    ) -> None:
-        """Ingesting the same chunk twice must result in skipped=1 on second call."""
-        # TODO: ingest once, ingest again, check IngestionResult.skipped == 1
-        pytest.skip("Implement after VectorStoreManager is complete")
+def test_duplicate_inside_same_batch(store, sample_chunk):
+    result = store.ingest([sample_chunk, sample_chunk])
+    assert (result.ingested, result.skipped) == (1, 1)
 
 
-# ---------------------------------------------------------------------------
-# Retrieval Tests
-# ---------------------------------------------------------------------------
+def test_relevant_query_returns_cited_text(store, sample_chunk):
+    store.ingest([sample_chunk])
+    results = store.query("What does the LSTM forget gate do?", k=100)
+    assert results
+    assert results[0].metadata.source == "lstm_intermediate.md"
+    assert results[0].score >= 0.3
 
 
-class TestRetrieval:
-    """
-    Tests for the query method.
+def test_off_topic_and_blank_queries_return_empty(store, sample_chunk):
+    store.ingest([sample_chunk])
+    assert store.query("history of the Roman empire") == []
+    assert store.query("   ") == []
+    assert store.query("LSTM", k=0) == []
 
-    These cover the hallucination guard threshold and metadata filtering,
-    both of which are common interview discussion topics.
-    """
 
-    def test_relevant_query_returns_results(
-        self, tmp_path, sample_chunk: DocumentChunk
-    ) -> None:
-        """A query semantically similar to an ingested chunk must return results."""
-        # TODO: ingest sample_chunk, query "LSTM gate mechanism", assert len > 0
-        pytest.skip("Implement after VectorStoreManager is complete")
+def test_empty_collection_returns_empty(store):
+    assert store.query("LSTM forget gate") == []
 
-    def test_irrelevant_query_returns_empty(self, tmp_path) -> None:
-        """
-        A query with no semantic similarity to the corpus must return empty list.
 
-        This tests the hallucination guard threshold. The system must return
-        an empty list — not low-quality chunks — when nothing matches.
-        """
-        # TODO: ingest sample_chunk, query "history of the roman empire"
-        # assert result == []
-        pytest.skip("Implement after VectorStoreManager is complete")
+def test_combined_filters_and_score_order(store, sample_chunk, bonus_chunk):
+    store.ingest([sample_chunk, bonus_chunk])
+    filtered = store.query(
+        sample_chunk.chunk_text, topic_filter="LSTM", difficulty_filter="intermediate"
+    )
+    assert filtered and all(chunk.metadata.topic == "LSTM" for chunk in filtered)
+    assert store.query("LSTM", topic_filter="LSTM", difficulty_filter="advanced") == []
+    store._settings.similarity_threshold = 0.0
+    results = store.query(sample_chunk.chunk_text)
+    assert len(results) == 2
+    assert [chunk.score for chunk in results] == sorted(
+        [chunk.score for chunk in results], reverse=True
+    )
 
-    def test_topic_filter_restricts_results(
-        self,
-        tmp_path,
-        sample_chunk: DocumentChunk,
-        bonus_chunk: DocumentChunk,
-    ) -> None:
-        """Results with topic_filter='LSTM' must not include GAN chunks."""
-        # TODO: ingest both chunks, query with topic_filter="LSTM"
-        # assert all(c.metadata.topic == "LSTM" for c in results)
-        pytest.skip("Implement after VectorStoreManager is complete")
 
-    def test_results_sorted_by_score_descending(
-        self, tmp_path, sample_chunk: DocumentChunk
-    ) -> None:
-        """Retrieved chunks must be sorted with highest similarity first."""
-        # TODO: ingest multiple chunks, verify scores are non-increasing
-        pytest.skip("Implement after VectorStoreManager is complete")
+def test_metadata_round_trip_and_delete(store, sample_chunk, bonus_chunk):
+    store.ingest([sample_chunk, bonus_chunk])
+    chunks = store.get_document_chunks("lstm_intermediate.md")
+    assert len(chunks) == 1
+    assert chunks[0].metadata == sample_chunk.metadata
+    stats = store.get_collection_stats()
+    assert stats["topics"] == ["GAN", "LSTM"]
+    assert stats["bonus_topics_present"]
+    assert len(store.list_documents()) == 2
+    assert store.delete_document("lstm_intermediate.md") == 1
+    assert store.get_collection_stats()["total_chunks"] == 1
+    assert store.get_document_chunks("lstm_intermediate.md") == []
+
+
+def test_data_survives_new_store_instance(store, sample_chunk):
+    store.ingest([sample_chunk])
+    reopened = VectorStoreManager(store._settings)
+    assert reopened.check_duplicate(sample_chunk.chunk_id)
+    assert reopened.query("forget gate")
+
+
+def test_strict_threshold_removes_weak_matches(store, sample_chunk):
+    store.ingest([sample_chunk])
+    store._settings.similarity_threshold = 0.999
+    assert store.query("What is LSTM?") == []
+
+
+def test_empty_chunk_is_reported(store, sample_chunk):
+    sample_chunk.chunk_text = " "
+    result = store.ingest([sample_chunk])
+    assert result.ingested == 0 and len(result.errors) == 1
